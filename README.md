@@ -5,7 +5,6 @@ Following my retirement from GMRP I still have time for small development projec
 
 ## Documenation
 [FAQ](docs/faq.md)\
-[Self Hosting](docs/hosting.md)\
 [Command Guide](docs/commands.md)
 
 
