@@ -29,21 +29,21 @@ Every GeoFS account has it’s own unique account ID called an acid. This is the
 []: optional parameters
 
 #### /account_checks query-callsigns <acid>
-**acid:** The account ID for the target account.
+**acid:** The account ID for the target account.\
 It returns all past callsigns from the account with that ID. It gives a list of all callsigns from pastCallsigns (OspreyDB) and lists the last time the user had that callsign. The callsigns are sorted with more recent dates near the top.
 
 #### /account_checks query-acids <exact_callsign|pattern> [verbose]
-**exact_callsign:** Returns all accounts that have had a past callsign with the exact name.
-**pattern:** You can provide a RegEX pattern to search across multiple callisgn names. (ADVANCED)
-**verbose:** Returns extra information on the account.
+**exact_callsign:** Returns all accounts that have had a past callsign with the exact name.\
+**pattern:** You can provide a RegEX pattern to search across multiple callisgn names. (ADVANCED)\
+**verbose:** Returns extra information on the account.\
+Returns all past callsigns accounts for the query parameter.
 
 #### /account_checks callsign-cross-check <acid|pattern>
-**acid:** The seed account for the search process.
-**pattern:** search by RegEX string
-
+**acid:** The seed account for the search process.\
+**pattern:** search by RegEX string\
 This command is a little complicated, but has worked well for finding GeoFS alt accounts. It works off of the assumption that people will have set the same callsign at one point for both of their GeoFS accounts. For example I have two accounts that have had the callsign "Osprey[U]".
 
-It will return a list of each account that has a hit. Below is the meaning of each item in each row.
-**GeoFS ACID:** This is the account ID that is suspected to be an alt. (Has had a past callsign that is the same as one of the past callsigns of the seed accounht.
-**Callsign Hit(s):** Shows the simliar callsign and which account was the seed account for the alt. If you are using "acid" for the search parameter you will only see one, but it may vary if you used a RegEx pattern.
+It will return a list of each account that has a hit. Below is the meaning of each item in each row.\
+**GeoFS ACID:** This is the account ID that is suspected to be an alt. (Has had a past callsign that is the same as one of the past callsigns of the seed accounht.\
+**Callsign Hit(s):** Shows the simliar callsign and which account was the seed account for the alt. If you are using "acid" for the search parameter you will only see one, but it may vary if you used a RegEx pattern.\
 **Current Callsign:** Shows the current callsign of the suspected alt account.
