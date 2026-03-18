@@ -31,6 +31,19 @@ class QueryDatabase(commands.Cog):
             return True
         except re.error:
             return False
+
+    def parse_regex_input(self, pattern_str: str):
+        """
+        Strips forward slashes from a regex string and extracts flags.
+        Example: "/^ANONYM$/i" returns ("^ANONYM$", "i")
+        Example: "ANONYM" returns ("ANONYM", "")
+        """
+        match = re.match(r'^/(.+)/([a-z]*)$', pattern_str)
+        if match:
+            return match.group(1), match.group(2) # Returns (pattern, flags)
+        
+        # Fallback just in case the user forgets the slashes
+        return pattern_str, ""
         
     account_checks_group = app_commands.Group(name="account_checks", description="Commands for doing background checks on users from the database.")
     
@@ -76,12 +89,18 @@ class QueryDatabase(commands.Cog):
         collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
 
         if pattern:
+            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
+            core_pattern, flags = self.parse_regex_input(pattern)
+            regex_query = {"$regex": core_pattern}
+            
+            valid_mongo_flags = set("imxs")
+            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
+            
+            if safe_flags:
+                regex_query["$options"] = safe_flags
+
             seed_documents = collection.find({
-                "pastCallsigns": {
-                    "$elemMatch": {
-                        "$regex": pattern
-                    }
-                }
+                "pastCallsigns": regex_query
             })
 
         if acid:
@@ -289,13 +308,18 @@ class QueryDatabase(commands.Cog):
             })
         
         if pattern:
+            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
+            core_pattern, flags = self.parse_regex_input(pattern)
+            regex_query = {"$regex": core_pattern}
+            
+            valid_mongo_flags = set("imxs")
+            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
+            
+            if safe_flags:
+                regex_query["$options"] = safe_flags
+
             results = collection.find({
-                "pastCallsigns": {
-                    "$elemMatch": {
-                        "$regex": pattern,
-                        "$options": "i"
-                    }
-                }
+                "pastCallsigns": regex_query
             })
 
         parsed_accounts = await results.to_list(length=None)
