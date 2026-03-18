@@ -37,8 +37,6 @@ class QueryDatabase(commands.Cog):
     @account_checks_group.command(name="callsign-cross-check", description="Does a cross account callsign similarity pairing.")
     @app_commands.describe(acid="The account ID of the source account.", pattern="Search multiple source accounts by a regex expression.")
     async def crossAccountCallsignSearch(self, interaction: discord.Interaction, acid: int = None, pattern: str = None):
-        collation = Collation(locale="en", strength=2)
-
         # parameter checks
         if (acid and pattern) or (not acid and not pattern):
             embed = discord.Embed(
@@ -81,8 +79,7 @@ class QueryDatabase(commands.Cog):
             seed_documents = collection.find({
                 "pastCallsigns": {
                     "$elemMatch": {
-                        "$regex": pattern,
-                        "$options": "i"
+                        "$regex": pattern
                     }
                 }
             })
@@ -102,8 +99,6 @@ class QueryDatabase(commands.Cog):
             if isinstance(cs, str) and cs.strip()
         }
 
-        seed_callsigns_lower = {cs.lower() for cs in seed_callsigns}
-
         seed_cs_to_acids = defaultdict(set)
         for _doc in parsed_seed_documents:
             _acid = _doc.get("accountID")
@@ -111,7 +106,7 @@ class QueryDatabase(commands.Cog):
                 if isinstance(_cs, str):
                     _cs2 = _cs.strip()
                     if _cs2:
-                        seed_cs_to_acids[_cs2.lower()].add(_acid)
+                        seed_cs_to_acids[_cs2].add(_acid)
 
         seed_account_ids = {
             d.get("accountID") for d in parsed_seed_documents if d.get("accountID") is not None
@@ -151,25 +146,29 @@ class QueryDatabase(commands.Cog):
         
         # find all accounts that have a past callsign of a past callsign of the seed documents.
 
-        second_generation_callsigns = collection.find(query, collation=collation)
+        second_generation_callsigns = collection.find(query)
         parsed_second_generation_callsigns = await second_generation_callsigns.to_list(length=None)
         
         callsign_list = []
         for doc in parsed_second_generation_callsigns:
             past = [cs for cs in doc.get("pastCallsigns", []) if isinstance(cs, str) and cs.strip()]
-            matched = [cs for cs in past if cs.lower() in seed_callsigns_lower]
+            
+            # Use seed_callsigns instead of seed_callsigns_lower
+            matched = [cs for cs in past if cs in seed_callsigns] 
+            
             if matched:
                 matched_details = []
                 for cs in matched:
-                    acids = sorted(a for a in seed_cs_to_acids.get(cs.lower(), set()) if a is not None)
+                    # Removed .lower() from the .get() method
+                    acids = sorted(a for a in seed_cs_to_acids.get(cs, set()) if a is not None)
                     if acids:
                         matched_details.append(f"{cs} (seed ACID(s): {', '.join(map(str, acids))})")
                     else:
                         matched_details.append(cs)
                 callsign_list.append(
-                    f"GeoFS ACID: {doc.get('accountID')}, "
-                    f"Callsign Hit(s): {', '.join(matched_details)}, "
-                    f"Current Callsign: {doc.get('currentCallsign')}"
+                    f"**GeoFS ACID:** {doc.get('accountID')}, "
+                    f"**Callsign Hit(s):** {', '.join(matched_details)}, "
+                    f"**Current Callsign:** {doc.get('currentCallsign')}"
                 )
         if not callsign_list:
             embed = discord.Embed(
@@ -183,6 +182,145 @@ class QueryDatabase(commands.Cog):
         embed = PaginatedEmbed(
             callsign_list,
             title="Callsign Hits",
-            description=f"{len(seed_account_ids)} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts."
+            description=f"{len(callsign_list)} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts."
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
+
+    @account_checks_group.command(name="query-callsigns", description="Pull a accounts past callsigns from OspreyEyesDB.")
+    @app_commands.describe(acid="GeoFS Account ID")
+    async def query(self, interaction: discord.Interaction, acid: int):
+        await interaction.response.defer()
+        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        
+        results = collection.find({"accountID": acid})
+        parsed_results = await results.to_list(length=None)
+
+        if len(parsed_results) > 1:
+            embed = discord.Embed(
+                title="Database Error 1",
+                description=(
+                    "Contact the Development Lead."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        parsed_results = parsed_results[0]
+        callsign_entries = []
+        for callsign in parsed_results['pastCallsigns']:
+            callsign_last_set = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            found_log = False
+            for event in parsed_results['events']:
+                if event['eventType'] == 'callsignChange' and event['newCallsign'] == callsign:
+                    found_log = True
+                    event_time = event['timestamp'].replace(tzinfo=timezone.utc)
+                    if event_time > callsign_last_set:
+                        callsign_last_set = event_time
+            if not found_log:
+                callsign_last_set = parsed_results['events'][0]['timestamp'].replace(tzinfo=timezone.utc)
+
+            callsign_entries.append({"callsign": callsign, "last_set": callsign_last_set})
+
+        callsign_entries.sort(key=lambda x: x["last_set"], reverse=True)
+        callsign_list = [
+            f"**Callsign**: {entry['callsign']} | **Last set**: {entry['last_set']}\n"
+            for entry in callsign_entries
+        ]
+
+        # create results embed
+        embed = PaginatedEmbed(
+            callsign_list,
+            title=f"Queried Callsigns",
+            description=f"{len(callsign_list)} callsign(s)"
+        )
+        await interaction.followup.send(embed=embed.embed, view=embed)
+
+    @account_checks_group.command(name="query-acids", description="Search by callsign for accounts from OspreyEyesDB.")
+    @app_commands.describe(
+        exact_callsign="Finds all accounts with a past callsign matching the query. (Case-insensitive)",
+        pattern="Search via a RegEx pattern. (ChatGPT it or somthing)",
+        verbose="Retrieves extra information."
+    )
+    async def query_Acids(
+        self,
+        interaction: discord.Interaction,
+        exact_callsign: str | None = None,
+        pattern: str | None = None,
+        verbose: bool = False
+    ):
+        # verify parameters
+        inputs = [exact_callsign, pattern]
+        provided = [x for x in inputs if x is not None]
+
+        if len(provided) != 1:
+            embed = discord.Embed(
+                title="Failed",
+                description=(
+                    "You must either give the a callsign or a pattern and not both."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+        
+        if pattern is not None and not self.isValidRegex(pattern):
+            embed = discord.Embed(
+                title="Failed",
+                description=(
+                    "Your regex is not valid. Could not compile."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+
+        await interaction.response.defer()
+        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+
+        if exact_callsign:
+            results = collection.find({
+                "pastCallsigns": {
+                    "$elemMatch": {
+                        "$regex": f"^{re.escape(exact_callsign)}$",
+                        "$options": "i"
+                    }
+                }
+            })
+        
+        if pattern:
+            results = collection.find({
+                "pastCallsigns": {
+                    "$elemMatch": {
+                        "$regex": pattern,
+                        "$options": "i"
+                    }
+                }
+            })
+
+        parsed_accounts = await results.to_list(length=None)
+        account_list = []
+        if parsed_accounts:
+            for document in parsed_accounts:
+                if verbose:
+                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']} | **Current Aircraft**: {document['currentAircraft']} | **Current Callsign**: {document['currentCallsign']} | **Last Online**: {document['lastOnline']}")
+                else:
+                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']}")
+        else:
+            embed = discord.Embed(
+                title="No Matches",
+                description="No accounts were found with past callsigns matching the given.",
+                color=discord.Color.yellow()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        embed = PaginatedEmbed(
+            account_list,
+            title=f"Queried Acccount IDs",
+            description=f"{len(account_list)} accounts(s) for **{exact_callsign if exact_callsign else pattern}**"
+        )
+        await interaction.followup.send(embed=embed.embed, view=embed)
+
+async def setup(bot: TreeDiagramPublic):
+    await bot.add_cog(QueryDatabase())
