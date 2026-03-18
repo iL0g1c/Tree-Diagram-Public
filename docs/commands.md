@@ -25,7 +25,7 @@ Every GeoFS account has it’s own unique account ID called an acid. This is the
 **Callsign Change:** If the bot detects a callsign change it is logged as an event. The event contains the old callsign, new callsign, and acid (account ID). The account must first come online before the bots detects the change.
 
 ### Database Commands
-<>: required parameters
+<>: required parameters\
 []: optional parameters
 
 #### /account_checks query-callsigns <acid>
