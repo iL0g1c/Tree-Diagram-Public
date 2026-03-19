@@ -10,6 +10,8 @@ from datetime import datetime, timezone, timedelta
 import re
 from io import StringIO
 import json
+from bson.json_util import dumps as bson_dumps
+from io import BytesIO
 
 from treeDiagramPublic import TreeDiagramPublic
 from tools.paginationEmbed import PaginatedEmbed
@@ -345,6 +347,42 @@ class QueryDatabase(commands.Cog):
             description=f"{len(account_list)} accounts(s) for **{exact_callsign if exact_callsign else pattern}**"
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
+
+    @account_checks_group.command(name="account_report", description="Pull a full account report.")
+    @app_commands.describe(
+        acid="The GeoFS Account ID for the account."
+    )
+    async def account_report(self, interaction: discord.Interaction, acid: int):
+        await interaction.response.defer()
+        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        account_doc = await collection.find_one({
+            "accountID": acid
+        })
+        if not account_doc:
+            embed = discord.Embed(
+                title="Failed",
+                description=(
+                    "Could not find that account."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        json_text = bson_dumps(account_doc, indent=2)
+        fp = BytesIO(json_text.encode("utf-8"))
+        fp.seek(0)
+
+        report_embed = discord.Embed(
+            title=f"Account Report for ACID {acid}",
+            description="Attached is the full document from the database.",
+            color=discord.Color.blue()
+        )
+
+        await interaction.followup.send(
+            embed=report_embed,
+            file=discord.File(fp, filename=f"account_{acid}.json")
+        )
 
 async def setup(bot: TreeDiagramPublic):
     await bot.add_cog(QueryDatabase())
