@@ -384,5 +384,39 @@ class QueryDatabase(commands.Cog):
             file=discord.File(fp, filename=f"account_{acid}.json")
         )
 
+    @account_checks_group.command(name="earliest_detection", description="Get the date of the earliest logged event.")
+    @app_commands.describe(
+        acid="The GeoFS Account ID for the account."
+    )
+    async def account_creation(self, interaction: discord.Interaction, acid: int):
+        await interaction.response.defer()
+        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        
+        results = collection.find({"accountID": acid})
+        parsed_results = await results.to_list(length=None)
+        if parsed_results == []:
+            embed = discord.Embed(
+                title="Failed",
+                description=(
+                    "Could not find that account."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        earliest_event = parsed_results[0]["events"][0]
+        for event in parsed_results[0]["events"]:
+            if event["timestamp"] < earliest_event["timestamp"]:
+                earliest_event = event
+
+        report_embed = discord.Embed(
+            title=f"Earliest detection",
+            description=f"The earliest event was a {earliest_event["eventType"]} at {earliest_event["timestamp"]} UTC",
+            color=discord.Color.blue()
+        )
+
+        await interaction.followup.send(embed=report_embed)
+
 async def setup(bot: TreeDiagramPublic):
     await bot.add_cog(QueryDatabase())
