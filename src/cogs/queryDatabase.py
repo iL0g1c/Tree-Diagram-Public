@@ -6,7 +6,7 @@ import os
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.collation import Collation
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import re
 from io import StringIO
 import json
@@ -15,16 +15,232 @@ from io import BytesIO
 
 from treeDiagramPublic import TreeDiagramPublic
 from tools.paginationEmbed import PaginatedEmbed
-from tools.configManager import ConfigManager
+
+
+load_dotenv()
+DATABASE_TOKEN = os.getenv('DATABASE_TOKEN')
+DATABASE_NAME = os.getenv('DATABASE_NAME')
+DATABASE_IP = os.getenv('DATABASE_IP')
+DATABASE_USER = os.getenv('DATABASE_USER')
+
+class EventSummaryModal(discord.ui.Modal):
+    def __init__(self, event_type: str, verbose: str, mongo_db_client):
+        super().__init__(title=f"Details for {event_type}")
+        self.event_type = event_type
+        self.verbose = verbose
+        self.mongo_db_client = mongo_db_client
+
+    acid = discord.ui.TextInput(
+        label="ACID (Numeric ID)",
+        placeholder="e.g., 12345",
+        style=discord.TextStyle.short,
+        required=True
+    )
+    
+    before = discord.ui.TextInput(
+        label="Before (YYYY-MM-DD HH:MM)",
+        placeholder="2026-03-19 12:00",
+        style=discord.TextStyle.short,
+        required=False
+    )
+    
+    after = discord.ui.TextInput(
+        label="After (YYYY-MM-DD HH:MM)",
+        placeholder="2026-03-19 13:00",
+        style=discord.TextStyle.short,
+        required=False
+    )
+
+    async def get_filtered_user_events(
+        self,
+        collection, 
+        acid: int = None, 
+        event_type: str = "all", # Defaulted to "all" for convenience
+        after_date: datetime = None, 
+        before_date: datetime = None
+    ):
+        """
+        Retrieves, filters, and sorts events from the users collection.
+        Supports special event types like 'all' and 'on-off'.
+        """
+        pipeline = []
+
+        # Stage 1: Initial Match
+        doc_match = {}
+        if acid is not None:
+            doc_match["accountID"] = acid
+            
+        if doc_match:
+            pipeline.append({"$match": doc_match})
+
+        # Stage 2: Unwind
+        pipeline.append({"$unwind": "$events"})
+
+        # Stage 3: Event-Level Match
+        event_match = {}
+        
+        # --- UPDATED EVENT TYPE LOGIC ---
+        if event_type and event_type.lower() != "all":
+            if event_type.lower() == "on-off":
+                # Match if the event is either online OR offline
+                event_match["events.eventType"] = {"$in": ["online", "offline"]}
+            else:
+                # Exact match for any other specific string (e.g., "banned", "kicked")
+                event_match["events.eventType"] = event_type
+                
+        # Build the date query dynamically
+        if after_date or before_date:
+            event_match["events.timestamp"] = {}
+            if after_date:
+                event_match["events.timestamp"]["$gte"] = after_date
+            if before_date:
+                event_match["events.timestamp"]["$lte"] = before_date
+                
+        if event_match:
+            pipeline.append({"$match": event_match})
+
+        # Stage 4: Sort (Descending: Newest first)
+        pipeline.append({"$sort": {"events.timestamp": -1}})
+
+        # Stage 5: Project
+        pipeline.append({
+            "$project": {
+                "_id": 0,
+                "accountID": 1,
+                "event": "$events" # Keeps the entire event object
+            }
+        })
+
+        # Execute
+        cursor = collection.aggregate(pipeline)
+        events = await cursor.to_list(length=None)
+        
+        return events
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            acid_val = int(self.acid.value)
+        except ValueError:
+            return await interaction.response.send_message(
+                "**Error:** Invalid input. Ensure ACID is a number.", 
+                ephemeral=True
+            )
+        
+        try:
+            if self.before.value != "":
+                b_date = datetime.strptime(self.before.value, "%Y-%m-%d %H:%M")
+            else:
+                b_date = datetime.max
+            if self.after.value != "":
+                a_date = datetime.strptime(self.after.value, "%Y-%m-%d %H:%M")
+            else:
+                a_date = datetime.min
+        except ValueError:
+            return await interaction.response.send_message(
+                "**Error:** Invalid input. Ensure dates match the `YYYY-MM-DD HH:MM` format.", 
+                ephemeral=True
+            )
+
+        await interaction.response.defer(thinking=True)
+
+        collection = self.mongo_db_client[DATABASE_NAME]["users"]
+
+        if self.event_type == "on-off":
+            raw_event_type = "on-off"
+        elif self.event_type == "tp":
+            raw_event_type = "teleporation"
+        elif self.event_type == "callsign":
+            raw_event_type = "callsignChange"
+        elif self.event_type == "aircraft":
+            raw_event_type = "aircraftChange"
+        elif self.event_type == "all":
+            raw_event_type = "All"
+            
+        results = await self.get_filtered_user_events(
+            collection=collection,
+            acid=acid_val,
+            event_type=raw_event_type,
+            after_date=a_date,
+            before_date=b_date
+        )
+        event_list = []
+        for event in results:
+            if event['event']["eventType"] == "online":
+                event_list.append(f"**Online:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+            elif event['event']["eventType"] == "offline":
+                event_list.append(f"**Offline:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+            elif event['event']["eventType"] == "teleporation":
+                if self.verbose == "No":
+                    event_list.append(f"**Teleporation:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    event_list.append(f"**Teleporation |** **Old Position:** ({event['event']['oldLatitude']}, {event['event']['oldLongitude']}) **New Position:** ({event['event']['newLatitude']},{event['event']['newLongitude']}) **Distance:** {event['event']['distance']} Meters **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+            elif event['event']["eventType"] == "aircraftChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Aircraft Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    event_list.append(f"**Aircraft Change |** **Old Aircraft:** {event['event']['oldAircraft']} **New Aircraft:** {event['event']['newAircraft']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+            elif event['event']["eventType"] == "callsignChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Callsign Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    event_list.append(f"**Callsign Change |** **Old Callsign:** {event['event']['oldCallsign']} **New Callsign:** {event['event']['newCallsign']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+
+        # create results embed
+        embed = PaginatedEmbed(
+            event_list,
+            title=f"Queried Events",
+            description=f"{len(event_list)} event(s)"
+        )
+        await interaction.followup.send(embed=embed.embed, view=embed)
+
+class EventSummaryView(discord.ui.View):
+    def __init__(self, mongo_db_client):
+        super().__init__(timeout=180)
+        self.event_type = None
+        self.verbose = None
+        self.mongo_db_client = mongo_db_client
+
+    @discord.ui.select(
+        placeholder="1. Select Event Type",
+        options=[
+            discord.SelectOption(label="All Events", value="all"), # <--- ADD THIS LINE
+            discord.SelectOption(label="Online or Offline", value="on-off"),
+            discord.SelectOption(label="Teleportation", value="tp"),
+            discord.SelectOption(label="Callsign Change", value="callsign"),
+            discord.SelectOption(label="Aircraft Change", value="aircraft"),
+        ],
+        custom_id="select_event"
+    )
+    async def select_event_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.event_type = select.values[0]
+        await interaction.response.defer()
+
+    @discord.ui.select(
+        placeholder="2. Enable Verbose?",
+        options=[
+            discord.SelectOption(label="Yes", value="Yes"),
+            discord.SelectOption(label="No", value="No"),
+        ],
+        custom_id="select_verbose"
+    )
+    async def select_verbose_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.verbose = select.values[0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Continue to Details", style=discord.ButtonStyle.success, row=2)
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.event_type or not self.verbose:
+            return await interaction.response.send_message(
+                "Please select both an Event Type and Verbose option first!", 
+                ephemeral=True
+            )
+        
+        modal = EventSummaryModal(self.event_type, self.verbose, self.mongo_db_client)
+        await interaction.response.send_modal(modal)
 
 class QueryDatabase(commands.Cog):
     def __init__(self):
-        load_dotenv()
-        DATABASE_TOKEN = os.getenv('DATABASE_TOKEN')
-        self.DATABASE_NAME = os.getenv('DATABASE_NAME')
-        DATABASE_IP = os.getenv('DATABASE_IP')
-        DATABASE_USER = os.getenv('DATABASE_USER')
-        mongodbURI = f"mongodb://{DATABASE_USER}:{DATABASE_TOKEN}@{DATABASE_IP}:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource={self.DATABASE_NAME}"
+        mongodbURI = f"mongodb://{DATABASE_USER}:{DATABASE_TOKEN}@{DATABASE_IP}:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource={DATABASE_NAME}"
         self.mongo_db_client = AsyncIOMotorClient(mongodbURI)
     
     def isValidRegex(self, pattern):
@@ -47,9 +263,9 @@ class QueryDatabase(commands.Cog):
         # Fallback just in case the user forgets the slashes
         return pattern_str, ""
         
-    account_checks_group = app_commands.Group(name="account_checks", description="Commands for doing background checks on users from the database.")
+    database_query = app_commands.Group(name="database_query", description="Commands for doing background checks on users from the database.")
     
-    @account_checks_group.command(name="callsign-cross-check", description="Does a cross account callsign similarity pairing.")
+    @database_query.command(name="callsign-cross-check", description="Does a cross account callsign similarity pairing.")
     @app_commands.describe(acid="The account ID of the source account.", pattern="Search multiple source accounts by a regex expression.")
     async def crossAccountCallsignSearch(self, interaction: discord.Interaction, acid: int = None, pattern: str = None):
         # parameter checks
@@ -88,7 +304,7 @@ class QueryDatabase(commands.Cog):
             return
                 
         # Fetch seed documents
-        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        collection = self.mongo_db_client[DATABASE_NAME]["users"]
 
         if pattern:
             # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
@@ -207,57 +423,7 @@ class QueryDatabase(commands.Cog):
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
 
-    @account_checks_group.command(name="query-callsigns", description="Pull a accounts past callsigns from OspreyEyesDB.")
-    @app_commands.describe(acid="GeoFS Account ID")
-    async def query(self, interaction: discord.Interaction, acid: int):
-        await interaction.response.defer()
-        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
-        
-        results = collection.find({"accountID": acid})
-        parsed_results = await results.to_list(length=None)
-
-        if len(parsed_results) > 1:
-            embed = discord.Embed(
-                title="Database Error 1",
-                description=(
-                    "Contact the Development Lead."
-                ),
-                color=discord.Color.red()
-            )
-            await interaction.followup.send(embed=embed)
-            return
-        
-        parsed_results = parsed_results[0]
-        callsign_entries = []
-        for callsign in parsed_results['pastCallsigns']:
-            callsign_last_set = datetime(1970, 1, 1, tzinfo=timezone.utc)
-            found_log = False
-            for event in parsed_results['events']:
-                if event['eventType'] == 'callsignChange' and event['newCallsign'] == callsign:
-                    found_log = True
-                    event_time = event['timestamp'].replace(tzinfo=timezone.utc)
-                    if event_time > callsign_last_set:
-                        callsign_last_set = event_time
-            if not found_log:
-                callsign_last_set = parsed_results['events'][0]['timestamp'].replace(tzinfo=timezone.utc)
-
-            callsign_entries.append({"callsign": callsign, "last_set": callsign_last_set})
-
-        callsign_entries.sort(key=lambda x: x["last_set"], reverse=True)
-        callsign_list = [
-            f"**Callsign**: {entry['callsign']} | **Last set**: {entry['last_set']}\n"
-            for entry in callsign_entries
-        ]
-
-        # create results embed
-        embed = PaginatedEmbed(
-            callsign_list,
-            title=f"Queried Callsigns",
-            description=f"{len(callsign_list)} callsign(s)"
-        )
-        await interaction.followup.send(embed=embed.embed, view=embed)
-
-    @account_checks_group.command(name="query-acids", description="Search by callsign for accounts from OspreyEyesDB.")
+    @database_query.command(name="query-acids", description="Search by callsign for accounts from OspreyEyesDB.")
     @app_commands.describe(
         exact_callsign="Finds all accounts with a past callsign matching the query. (Case-insensitive)",
         pattern="Search via a RegEx pattern. (ChatGPT it or somthing)",
@@ -297,7 +463,7 @@ class QueryDatabase(commands.Cog):
             return
 
         await interaction.response.defer()
-        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        collection = self.mongo_db_client[DATABASE_NAME]["users"]
 
         if exact_callsign:
             results = collection.find({
@@ -348,13 +514,13 @@ class QueryDatabase(commands.Cog):
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
 
-    @account_checks_group.command(name="account_report", description="Pull a full account report.")
+    @database_query.command(name="account_report", description="Pull a full account report.")
     @app_commands.describe(
         acid="The GeoFS Account ID for the account."
     )
     async def account_report(self, interaction: discord.Interaction, acid: int):
         await interaction.response.defer()
-        collection = self.mongo_db_client[self.DATABASE_NAME]["users"]
+        collection = self.mongo_db_client[DATABASE_NAME]["users"]
         account_doc = await collection.find_one({
             "accountID": acid
         })
@@ -383,6 +549,50 @@ class QueryDatabase(commands.Cog):
             embed=report_embed,
             file=discord.File(fp, filename=f"account_{acid}.json")
         )
+
+    @database_query.command(name="earliest_detection", description="Get the date of the earliest logged event.")
+    @app_commands.describe(
+        acid="The GeoFS Account ID for the account."
+    )
+    async def account_creation(self, interaction: discord.Interaction, acid: int):
+        await interaction.response.defer()
+        collection = self.mongo_db_client[DATABASE_NAME]["users"]
+        
+        results = collection.find({"accountID": acid})
+        parsed_results = await results.to_list(length=None)
+        if parsed_results == []:
+            embed = discord.Embed(
+                title="Failed",
+                description=(
+                    "Could not find that account."
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        earliest_event = parsed_results[0]["events"][0]
+        for event in parsed_results[0]["events"]:
+            if event["timestamp"] < earliest_event["timestamp"]:
+                earliest_event = event
+
+        report_embed = discord.Embed(
+            title=f"Earliest detection",
+            description=f"The earliest event was a {earliest_event["eventType"]} at {earliest_event["timestamp"]} UTC",
+            color=discord.Color.blue()
+        )
+
+        await interaction.followup.send(embed=report_embed)
+
+    @database_query.command(name="event_summary", description="Get a summary of an event.")
+    async def log_event(self, interaction: discord.Interaction):
+        view = EventSummaryView(self.mongo_db_client)
+        await interaction.response.send_message(
+            "Please configure the event settings below, then click Continue:", 
+            view=view,
+            ephemeral=True
+        )
+
 
 async def setup(bot: TreeDiagramPublic):
     await bot.add_cog(QueryDatabase())
