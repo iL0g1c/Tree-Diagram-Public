@@ -28,10 +28,6 @@ Every GeoFS account has it’s own unique account ID called an acid. This is the
 <>: required parameters\
 []: optional parameters
 
-#### /account_checks query-callsigns <acid>
-**acid:** The account ID for the target account.\
-It returns all past callsigns from the account with that ID. It gives a list of all callsigns from pastCallsigns (OspreyDB) and lists the last time the user had that callsign. The callsigns are sorted with more recent dates near the top.
-
 #### /account_checks query-acids <exact_callsign|pattern> [verbose]
 **exact_callsign:** Returns all accounts that have had a past callsign with the exact name.\
 **pattern:** You can provide a RegEX pattern to search across multiple callisgn names. (ADVANCED)\
@@ -55,3 +51,6 @@ This command returns all data in OspreyDB for the specified account as a json fi
 #### /account_checks account_creation <acid>
 **acid:** The account ID for the target account.\
 Returns the first event that OspreyEyes recorded. This can be used to infer the actual age of the account. (Note: The logs only go back to June 2025, so it will not show any accounts that are older than that.)
+
+#### /account_checks event_summary
+This command creates a selection menu and modal to allow you to configure a broad search of the database. It is self explanatory.
