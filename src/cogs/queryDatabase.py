@@ -240,6 +240,7 @@ class EventSummaryView(discord.ui.View):
 
 class QueryDatabase(commands.Cog):
     def __init__(self):
+        super().__init__()
         mongodbURI = f"mongodb://{DATABASE_USER}:{DATABASE_TOKEN}@{DATABASE_IP}:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource={DATABASE_NAME}"
         self.mongo_db_client = AsyncIOMotorClient(mongodbURI)
     
@@ -319,7 +320,7 @@ class QueryDatabase(commands.Cog):
 
             seed_documents = collection.find({
                 "pastCallsigns": regex_query
-            })
+            }).max_time_ms(2000)
 
         if acid:
             seed_documents = collection.find({
@@ -358,11 +359,6 @@ class QueryDatabase(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
         
-        seed_account_ids = {
-            doc.get("accountID")
-            for doc in parsed_seed_documents
-            if doc.get("accountID") is not None
-        }
         seed_object_ids = {
             doc.get("_id")
             for doc in parsed_seed_documents
@@ -488,9 +484,9 @@ class QueryDatabase(commands.Cog):
 
             results = collection.find({
                 "pastCallsigns": regex_query
-            })
+            }).max_time_ms(2000)
 
-        parsed_accounts = await results.to_list(length=None)
+        parsed_accounts = await results.to_list(length=500)
         account_list = []
         if parsed_accounts:
             for document in parsed_accounts:
@@ -559,7 +555,7 @@ class QueryDatabase(commands.Cog):
         collection = self.mongo_db_client[DATABASE_NAME]["users"]
         
         results = collection.find({"accountID": acid})
-        parsed_results = await results.to_list(length=None)
+        parsed_results = await results.to_list(length=500)
         if parsed_results == []:
             embed = discord.Embed(
                 title="Failed",
@@ -571,14 +567,17 @@ class QueryDatabase(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
         
-        earliest_event = parsed_results[0]["events"][0]
+        user_doc = parsed_results[0]
+        events = user_doc.get("events", [])
+        if not events:
+            return await interaction.followup.send("No events recorded for this account.")
         for event in parsed_results[0]["events"]:
             if event["timestamp"] < earliest_event["timestamp"]:
                 earliest_event = event
 
         report_embed = discord.Embed(
             title=f"Earliest detection",
-            description=f"The earliest event was a {earliest_event["eventType"]} at {earliest_event["timestamp"]} UTC",
+            description=f"The earliest event was a {earliest_event['eventType']} at {earliest_event['timestamp']} UTC",
             color=discord.Color.blue()
         )
 
