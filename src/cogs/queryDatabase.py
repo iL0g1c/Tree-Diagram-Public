@@ -571,6 +571,7 @@ class QueryDatabase(commands.Cog):
         events = user_doc.get("events", [])
         if not events:
             return await interaction.followup.send("No events recorded for this account.")
+        earliest_event = events[0]
         for event in parsed_results[0]["events"]:
             if event["timestamp"] < earliest_event["timestamp"]:
                 earliest_event = event
