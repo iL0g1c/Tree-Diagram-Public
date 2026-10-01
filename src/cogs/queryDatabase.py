@@ -3,8 +3,6 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import os
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.collation import Collation
 from collections import defaultdict
 from datetime import datetime
 import re
@@ -12,9 +10,10 @@ from io import StringIO
 import json
 from bson.json_util import dumps as bson_dumps
 from io import BytesIO
+import aiohttp
 
 from treeDiagramPublic import TreeDiagramPublic
-from tools.paginationEmbed import PaginatedEmbed
+from tools.serverPaginatedEmbed import ServerPaginatedEmbed
 
 
 load_dotenv()
@@ -24,11 +23,15 @@ DATABASE_IP = os.getenv('DATABASE_IP')
 DATABASE_USER = os.getenv('DATABASE_USER')
 
 class EventSummaryModal(discord.ui.Modal):
-    def __init__(self, event_type: str, verbose: str, mongo_db_client):
+    def __init__(self, event_type: str, verbose: str):
         super().__init__(title=f"Details for {event_type}")
         self.event_type = event_type
         self.verbose = verbose
-        self.mongo_db_client = mongo_db_client
+
+        self.acid_val = None
+        self.a_date = None
+        self.b_date = None
+        self.raw_event_type = None
 
     acid = discord.ui.TextInput(
         label="ACID (Numeric ID)",
@@ -51,75 +54,76 @@ class EventSummaryModal(discord.ui.Modal):
         required=False
     )
 
-    async def get_filtered_user_events(
-        self,
-        collection, 
-        acid: int = None, 
-        event_type: str = "all", # Defaulted to "all" for convenience
-        after_date: datetime = None, 
-        before_date: datetime = None
-    ):
-        """
-        Retrieves, filters, and sorts events from the users collection.
-        Supports special event types like 'all' and 'on-off'.
-        """
-        pipeline = []
+    async def fetch_and_format_events(self, page: int, per_page: int) -> tuple[list, int]:
+        """Fetches a specific page of events from the Flask API and formats them."""
+        params = {
+            "page": page,
+            "per_page": per_page,
+            "acid": self.acid_val,
+            "event_type": self.raw_event_type,
+        }
+        if self.a_date:
+            params["after"] = self.a_date.isoformat()
+        if self.b_date:
+            params["before"] = self.b_date.isoformat()
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/events/filter"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return [], 0
+                data = await resp.json()
+        
+        results = data.get("results", [])
+        total_count = data.get("count", 0)
 
-        # Stage 1: Initial Match
-        doc_match = {}
-        if acid is not None:
-            doc_match["accountID"] = acid
+        event_list = []
+        for item in results:
+            event = item.get("event", {})
+            e_type = event.get("eventType")
             
-        if doc_match:
-            pipeline.append({"$match": doc_match})
-
-        # Stage 2: Unwind
-        pipeline.append({"$unwind": "$events"})
-
-        # Stage 3: Event-Level Match
-        event_match = {}
-        
-        # --- UPDATED EVENT TYPE LOGIC ---
-        if event_type and event_type.lower() != "all":
-            if event_type.lower() == "on-off":
-                # Match if the event is either online OR offline
-                event_match["events.eventType"] = {"$in": ["online", "offline"]}
+            ts_raw = event.get("timestamp", {})
+            if isinstance(ts_raw, dict) and "$date" in ts_raw:
+                date_val = ts_raw["$date"]
+                if isinstance(date_val, str):
+                    dt = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromtimestamp(date_val / 1000.0)
             else:
-                # Exact match for any other specific string (e.g., "banned", "kicked")
-                event_match["events.eventType"] = event_type
+                dt = datetime.now()
                 
-        # Build the date query dynamically
-        if after_date or before_date:
-            event_match["events.timestamp"] = {}
-            if after_date:
-                event_match["events.timestamp"]["$gte"] = after_date
-            if before_date:
-                event_match["events.timestamp"]["$lte"] = before_date
-                
-        if event_match:
-            pipeline.append({"$match": event_match})
+            ts_str = dt.strftime('%Y-%m-%d %H:%M')
 
-        # Stage 4: Sort (Descending: Newest first)
-        pipeline.append({"$sort": {"events.timestamp": -1}})
-
-        # Stage 5: Project
-        pipeline.append({
-            "$project": {
-                "_id": 0,
-                "accountID": 1,
-                "event": "$events" # Keeps the entire event object
-            }
-        })
-
-        # Execute
-        cursor = collection.aggregate(pipeline)
-        events = await cursor.to_list(length=None)
+            if e_type == "online":
+                event_list.append(f"**Online:** {ts_str}")
+            elif e_type == "offline":
+                event_list.append(f"**Offline:** {ts_str}")
+            elif e_type == "teleporation":
+                if self.verbose == "No":
+                    event_list.append(f"**Teleporation:** {ts_str}")
+                else:
+                    event_list.append(f"**Teleporation |** **Old Pos:** ({event.get('oldLatitude')}, {event.get('oldLongitude')}) **New Pos:** ({event.get('newLatitude')},{event.get('newLongitude')}) **Dist:** {event.get('distance')}m **Time:** {ts_str}")
+            elif e_type == "aircraftChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Aircraft Change:** {ts_str}")
+                else:
+                    event_list.append(f"**Aircraft Change |** **Old:** {event.get('oldAircraft')} **New:** {event.get('newAircraft')} **Time:** {ts_str}")
+            elif e_type == "callsignChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Callsign Change:** {ts_str}")
+                else:
+                    event_list.append(f"**Callsign Change |** **Old:** {event.get('oldCallsign')} **New:** {event.get('newCallsign')} **Time:** {ts_str}")
         
-        return events
+        return event_list, total_count
+    
+    async def fetch_page_callback(self, page: int, per_page: int) -> list:
+        """Wrapper method used exclusively by the ServerPaginatedEmbed to grab the items list."""
+        items, _ = await self.fetch_and_format_events(page, per_page)
+        return items
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            acid_val = int(self.acid.value)
+            self.acid_val = int(self.acid.value)
         except ValueError:
             return await interaction.response.send_message(
                 "**Error:** Invalid input. Ensure ACID is a number.", 
@@ -128,13 +132,13 @@ class EventSummaryModal(discord.ui.Modal):
         
         try:
             if self.before.value != "":
-                b_date = datetime.strptime(self.before.value, "%Y-%m-%d %H:%M")
+                self.b_date = datetime.strptime(self.before.value, "%Y-%m-%d %H:%M")
             else:
-                b_date = datetime.max
+                self.b_date = None
             if self.after.value != "":
-                a_date = datetime.strptime(self.after.value, "%Y-%m-%d %H:%M")
+                self.a_date = datetime.strptime(self.after.value, "%Y-%m-%d %H:%M")
             else:
-                a_date = datetime.min
+                self.a_date = None
         except ValueError:
             return await interaction.response.send_message(
                 "**Error:** Invalid input. Ensure dates match the `YYYY-MM-DD HH:MM` format.", 
@@ -143,62 +147,38 @@ class EventSummaryModal(discord.ui.Modal):
 
         await interaction.response.defer(thinking=True)
 
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-
         if self.event_type == "on-off":
-            raw_event_type = "on-off"
+            self.raw_event_type = "on-off"
         elif self.event_type == "tp":
-            raw_event_type = "teleporation"
+            self.raw_event_type = "teleporation"
         elif self.event_type == "callsign":
-            raw_event_type = "callsignChange"
+            self.raw_event_type = "callsignChange"
         elif self.event_type == "aircraft":
-            raw_event_type = "aircraftChange"
+            self.raw_event_type = "aircraftChange"
         elif self.event_type == "all":
-            raw_event_type = "All"
+            self.raw_event_type = "All"
             
-        results = await self.get_filtered_user_events(
-            collection=collection,
-            acid=acid_val,
-            event_type=raw_event_type,
-            after_date=a_date,
-            before_date=b_date
-        )
-        event_list = []
-        for event in results:
-            if event['event']["eventType"] == "online":
-                event_list.append(f"**Online:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "offline":
-                event_list.append(f"**Offline:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "teleporation":
-                if self.verbose == "No":
-                    event_list.append(f"**Teleporation:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Teleporation |** **Old Position:** ({event['event']['oldLatitude']}, {event['event']['oldLongitude']}) **New Position:** ({event['event']['newLatitude']},{event['event']['newLongitude']}) **Distance:** {event['event']['distance']} Meters **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "aircraftChange":
-                if self.verbose == "No":
-                    event_list.append(f"**Aircraft Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Aircraft Change |** **Old Aircraft:** {event['event']['oldAircraft']} **New Aircraft:** {event['event']['newAircraft']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "callsignChange":
-                if self.verbose == "No":
-                    event_list.append(f"**Callsign Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Callsign Change |** **Old Callsign:** {event['event']['oldCallsign']} **New Callsign:** {event['event']['newCallsign']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+        initial_items, total_items = await self.fetch_and_format_events(1, 10)
 
-        # create results embed
-        embed = PaginatedEmbed(
-            event_list,
-            title=f"Queried Events",
-            description=f"{len(event_list)} event(s)"
+        if total_items == 0:
+            return await interaction.followup.send("No events found matching your criteria.")
+
+        # 3. Initialize the Paginator passing the class method as the callback
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=self.fetch_page_callback,
+            title=f"Queried Events (ACID: {self.acid_val})",
+            description=f"{total_items} event(s) found.",
+            items_per_page=10
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
 
 class EventSummaryView(discord.ui.View):
-    def __init__(self, mongo_db_client):
+    def __init__(self):
         super().__init__(timeout=180)
         self.event_type = None
         self.verbose = None
-        self.mongo_db_client = mongo_db_client
 
     @discord.ui.select(
         placeholder="1. Select Event Type",
@@ -235,13 +215,12 @@ class EventSummaryView(discord.ui.View):
                 ephemeral=True
             )
         
-        modal = EventSummaryModal(self.event_type, self.verbose, self.mongo_db_client)
+        modal = EventSummaryModal(self.event_type, self.verbose)
         await interaction.response.send_modal(modal)
 
 class QueryDatabase(commands.Cog):
     def __init__(self):
-        mongodbURI = f"mongodb://{DATABASE_USER}:{DATABASE_TOKEN}@{DATABASE_IP}:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource={DATABASE_NAME}"
-        self.mongo_db_client = AsyncIOMotorClient(mongodbURI)
+        super().__init__()
     
     def isValidRegex(self, pattern):
         try:
@@ -272,9 +251,7 @@ class QueryDatabase(commands.Cog):
         if (acid and pattern) or (not acid and not pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "You must either give the acid or a pattern and not both."
-                ),
+                description="You must either give the acid or a pattern and not both.",
                 color=discord.Color.red()
             )
             await interaction.response.send_message(embed=embed)
@@ -283,9 +260,7 @@ class QueryDatabase(commands.Cog):
         if pattern is not None and not self.isValidRegex(pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "Your regex is not valid. Could not compile."
-                ),
+                description="Your regex is not valid. Could not compile.",
                 color=discord.Color.red()
             )
             await interaction.response.send_message(embed=embed)
@@ -293,134 +268,73 @@ class QueryDatabase(commands.Cog):
         
         await interaction.response.defer()
 
-        if pattern is not None and not str(pattern).strip():
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="Failed",
-                    description="Pattern cannot be empty or whitespace.",
-                    color=discord.Color.red()
+        # Define the pagination callback inside the command closure
+        async def fetch_page_callback(page: int, per_page: int) -> list:
+            params = {
+                "page": page,
+                "per_page": per_page
+            }
+            if acid: params["acid"] = acid
+            if pattern: params["pattern"] = pattern
+
+            api_url = f"http://{DATABASE_IP}:5011/api/v2/callsign-cross-check"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, params=params) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+
+            results = data.get("results", [])
+            formatted_items = []
+            for item in results:
+                formatted_items.append(
+                    f"**GeoFS ACID:** {item.get('accountID')}, "
+                    f"**Callsign Hit(s):** {', '.join(item.get('matchedDetails', []))}, "
+                    f"**Current Callsign:** {item.get('currentCallsign')}"
                 )
-            )
-            return
-                
-        # Fetch seed documents
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
+            return formatted_items
 
-        if pattern:
-            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
-            core_pattern, flags = self.parse_regex_input(pattern)
-            regex_query = {"$regex": core_pattern}
-            
-            valid_mongo_flags = set("imxs")
-            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
-            
-            if safe_flags:
-                regex_query["$options"] = safe_flags
+        # Fetch the very first page to establish total count and initial items
+        params = {"page": 1, "per_page": 10}
+        if acid: params["acid"] = acid
+        if pattern: params["pattern"] = pattern
 
-            seed_documents = collection.find({
-                "pastCallsigns": regex_query
-            })
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/callsign-cross-check"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send("Failed to contact the database API.")
+                data = await resp.json()
 
-        if acid:
-            seed_documents = collection.find({
-                "accountID": acid
-            })
-
-        parsed_seed_documents = await seed_documents.to_list(length=None)
-
-        # Flatten & dedupe all pastCallsigns from the seed docs
-        seed_callsigns = {
-            cs.strip()
-            for doc in parsed_seed_documents
-            for cs in doc.get("pastCallsigns", [])
-            if isinstance(cs, str) and cs.strip()
-        }
-
-        seed_cs_to_acids = defaultdict(set)
-        for _doc in parsed_seed_documents:
-            _acid = _doc.get("accountID")
-            for _cs in _doc.get("pastCallsigns", []):
-                if isinstance(_cs, str):
-                    _cs2 = _cs.strip()
-                    if _cs2:
-                        seed_cs_to_acids[_cs2].add(_acid)
-
-        seed_account_ids = {
-            d.get("accountID") for d in parsed_seed_documents if d.get("accountID") is not None
-        }
-
-        if not seed_callsigns:
-            embed = discord.Embed(
-                title="No Seed Callsigns",
-                description="No non-empty past callsigns were found in the seed documents.",
-                color=discord.Color.yellow()
-            )
-            await interaction.followup.send(embed=embed)
-            return
+        total_items = data.get("count", 0)
         
-        seed_account_ids = {
-            doc.get("accountID")
-            for doc in parsed_seed_documents
-            if doc.get("accountID") is not None
-        }
-        seed_object_ids = {
-            doc.get("_id")
-            for doc in parsed_seed_documents
-            if doc.get("_id") is not None
-        }
-
-        query = {
-            "pastCallsigns": {"$in": list(seed_callsigns)}
-        }
-
-        # Exclude the seed accounts themselves
-        if seed_account_ids:
-            query["accountID"] = {"$nin": list(seed_account_ids)}
-        elif seed_object_ids:
-            # fallback if accountID isn't present
-            query["_id"] = {"$nin": list(seed_object_ids)}
-
-        
-        # find all accounts that have a past callsign of a past callsign of the seed documents.
-
-        second_generation_callsigns = collection.find(query)
-        parsed_second_generation_callsigns = await second_generation_callsigns.to_list(length=None)
-        
-        callsign_list = []
-        for doc in parsed_second_generation_callsigns:
-            past = [cs for cs in doc.get("pastCallsigns", []) if isinstance(cs, str) and cs.strip()]
-            
-            # Use seed_callsigns instead of seed_callsigns_lower
-            matched = [cs for cs in past if cs in seed_callsigns] 
-            
-            if matched:
-                matched_details = []
-                for cs in matched:
-                    # Removed .lower() from the .get() method
-                    acids = sorted(a for a in seed_cs_to_acids.get(cs, set()) if a is not None)
-                    if acids:
-                        matched_details.append(f"{cs} (seed ACID(s): {', '.join(map(str, acids))})")
-                    else:
-                        matched_details.append(cs)
-                callsign_list.append(
-                    f"**GeoFS ACID:** {doc.get('accountID')}, "
-                    f"**Callsign Hit(s):** {', '.join(matched_details)}, "
-                    f"**Current Callsign:** {doc.get('currentCallsign')}"
-                )
-        if not callsign_list:
+        if total_items == 0:
             embed = discord.Embed(
                 title="No Matches",
                 description="No accounts were found sharing non-empty past callsigns with the seed set.",
                 color=discord.Color.yellow()
             )
-            await interaction.followup.send(embed=embed)
-            return
+            return await interaction.followup.send(embed=embed)
 
-        embed = PaginatedEmbed(
-            callsign_list,
+        initial_items = []
+        for item in data.get("results", []):
+            initial_items.append(
+                f"**GeoFS ACID:** {item.get('accountID')}, "
+                f"**Callsign Hit(s):** {', '.join(item.get('matchedDetails', []))}, "
+                f"**Current Callsign:** {item.get('currentCallsign')}"
+            )
+
+        # Initialize the server paginated embed with our callback
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=fetch_page_callback,
             title="Callsign Hits",
-            description=f"{len(callsign_list)} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts."
+            description=f"{total_items} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts.",
+            items_per_page=10
         )
+        
         await interaction.followup.send(embed=embed.embed, view=embed)
 
     @database_query.command(name="query-acids", description="Search by callsign for accounts from OspreyEyesDB.")
@@ -436,82 +350,90 @@ class QueryDatabase(commands.Cog):
         pattern: str | None = None,
         verbose: bool = False
     ):
-        # verify parameters
-        inputs = [exact_callsign, pattern]
-        provided = [x for x in inputs if x is not None]
-
-        if len(provided) != 1:
+        if (exact_callsign and pattern) or (not exact_callsign and not pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "You must either give the a callsign or a pattern and not both."
-                ),
+                description="You must provide either an exact callsign or a pattern, but not both.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed)
-            return
+            return await interaction.response.send_message(embed=embed)
         
         if pattern is not None and not self.isValidRegex(pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "Your regex is not valid. Could not compile."
-                ),
+                description="Your regex is not valid. Could not compile.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed)
-            return
+            return await interaction.response.send_message(embed=embed)
 
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
 
-        if exact_callsign:
-            results = collection.find({
-                "pastCallsigns": {
-                    "$elemMatch": {
-                        "$regex": f"^{re.escape(exact_callsign)}$",
-                        "$options": "i"
-                    }
-                }
-            })
-        
-        if pattern:
-            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
-            core_pattern, flags = self.parse_regex_input(pattern)
-            regex_query = {"$regex": core_pattern}
+        # Define the pagination callback
+        async def fetch_page_callback(page: int, per_page: int) -> list:
+            params = {
+                "page": page,
+                "per_page": per_page
+            }
+            if exact_callsign: params["exact_callsign"] = exact_callsign
+            if pattern: params["pattern"] = pattern
+
+            api_url = f"http://{DATABASE_IP}:5011/api/v2/users/search"
             
-            valid_mongo_flags = set("imxs")
-            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
-            
-            if safe_flags:
-                regex_query["$options"] = safe_flags
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, params=params) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
 
-            results = collection.find({
-                "pastCallsigns": regex_query
-            })
-
-        parsed_accounts = await results.to_list(length=None)
-        account_list = []
-        if parsed_accounts:
-            for document in parsed_accounts:
+            results = data.get("results", [])
+            formatted_items = []
+            for doc in results:
                 if verbose:
-                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']} | **Current Aircraft**: {document['currentAircraft']} | **Current Callsign**: {document['currentCallsign']} | **Last Online**: {document['lastOnline']}")
+                    formatted_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')} | **Current Aircraft**: {doc.get('currentAircraft')} | **Current Callsign**: {doc.get('currentCallsign')} | **Last Online**: {doc.get('lastOnline')}")
                 else:
-                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']}")
-        else:
+                    formatted_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')}")
+            return formatted_items
+
+        # Fetch the first page to get the total count
+        params = {"page": 1, "per_page": 10}
+        if exact_callsign: params["exact_callsign"] = exact_callsign
+        if pattern: params["pattern"] = pattern
+
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/users/search"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send("Failed to contact the database API.")
+                data = await resp.json()
+
+        total_items = data.get("count", 0)
+
+        if total_items == 0:
             embed = discord.Embed(
                 title="No Matches",
-                description="No accounts were found with past callsigns matching the given.",
+                description="No accounts were found with past callsigns matching the given query.",
                 color=discord.Color.yellow()
             )
-            await interaction.followup.send(embed=embed)
-            return
-        
-        embed = PaginatedEmbed(
-            account_list,
-            title=f"Queried Acccount IDs",
-            description=f"{len(account_list)} accounts(s) for **{exact_callsign if exact_callsign else pattern}**"
+            return await interaction.followup.send(embed=embed)
+
+        # Format initial items
+        initial_items = []
+        for doc in data.get("results", []):
+            if verbose:
+                initial_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')} | **Current Aircraft**: {doc.get('currentAircraft')} | **Current Callsign**: {doc.get('currentCallsign')} | **Last Online**: {doc.get('lastOnline')}")
+            else:
+                initial_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')}")
+
+        search_term = exact_callsign if exact_callsign else pattern
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=fetch_page_callback,
+            title="Queried Account IDs",
+            description=f"{total_items} account(s) found for **{search_term}**",
+            items_per_page=10
         )
+        
         await interaction.followup.send(embed=embed.embed, view=embed)
 
     @database_query.command(name="account_report", description="Pull a full account report.")
@@ -520,11 +442,17 @@ class QueryDatabase(commands.Cog):
     )
     async def account_report(self, interaction: discord.Interaction, acid: int):
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-        account_doc = await collection.find_one({
-            "accountID": acid
-        })
-        if not account_doc:
+        params = {
+            "acid": acid
+        }
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/users/"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return [], 0
+                data = await resp.json()
+        if not data:
             embed = discord.Embed(
                 title="Failed",
                 description=(
@@ -535,7 +463,7 @@ class QueryDatabase(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
-        json_text = bson_dumps(account_doc, indent=2)
+        json_text = bson_dumps(data, indent=2)
         fp = BytesIO(json_text.encode("utf-8"))
         fp.seek(0)
 
@@ -556,29 +484,47 @@ class QueryDatabase(commands.Cog):
     )
     async def account_creation(self, interaction: discord.Interaction, acid: int):
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-        
-        results = collection.find({"accountID": acid})
-        parsed_results = await results.to_list(length=None)
-        if parsed_results == []:
-            embed = discord.Embed(
-                title="Failed",
-                description=(
-                    "Could not find that account."
-                ),
-                color=discord.Color.red()
-            )
-            await interaction.followup.send(embed=embed)
-            return
-        
-        earliest_event = parsed_results[0]["events"][0]
-        for event in parsed_results[0]["events"]:
-            if event["timestamp"] < earliest_event["timestamp"]:
-                earliest_event = event
+
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/events/earliest"
+        params = {"acid": acid}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status == 404:
+                    embed = discord.Embed(
+                        title="No Events",
+                        description="No events recorded for this account, or the account doesn't exist.",
+                        color=discord.Color.yellow()
+                    )
+                    return await interaction.followup.send(embed=embed)
+                elif resp.status != 200:
+                    embed = discord.Embed(
+                        title="Failed",
+                        description="Failed to contact the database API.",
+                        color=discord.Color.red()
+                    )
+                    return await interaction.followup.send(embed=embed)
+                
+                data = await resp.json()
+
+        event = data.get("event", {})
+        if not event:
+            return await interaction.followup.send("No events recorded for this account.")
+
+        ts_raw = event.get("timestamp", {})
+        if isinstance(ts_raw, dict) and "$date" in ts_raw:
+            date_val = ts_raw["$date"]
+            if isinstance(date_val, str):
+                dt = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
+            else:
+                dt = datetime.fromtimestamp(date_val / 1000.0)
+            ts_str = dt.strftime('%Y-%m-%d %H:%M UTC')
+        else:
+            ts_str = str(ts_raw)  # Fallback just in case
 
         report_embed = discord.Embed(
-            title=f"Earliest detection",
-            description=f"The earliest event was a {earliest_event["eventType"]} at {earliest_event["timestamp"]} UTC",
+            title="Earliest Detection",
+            description=f"The earliest event was a **{event.get('eventType')}** at **{ts_str}**",
             color=discord.Color.blue()
         )
 
@@ -586,7 +532,7 @@ class QueryDatabase(commands.Cog):
 
     @database_query.command(name="event_summary", description="Get a summary of an event.")
     async def log_event(self, interaction: discord.Interaction):
-        view = EventSummaryView(self.mongo_db_client)
+        view = EventSummaryView()
         await interaction.response.send_message(
             "Please configure the event settings below, then click Continue:", 
             view=view,
